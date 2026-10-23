@@ -1,0 +1,476 @@
+# your existing imports
+import re
+
+import numpy as np
+import fitz
+import docx
+import pandas as pd
+import time
+import requests
+from pathlib import Path
+
+from uuid import uuid4
+import os
+
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_text_splitters import TokenTextSplitter
+from langchain_community.vectorstores import FAISS
+from llm_config import llm,embeddings
+
+text_splitter = TokenTextSplitter(chunk_size=1024, chunk_overlap=50)
+# Regex to match illegal control characters
+ILLEGAL_CHARACTERS_RE = re.compile(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]')
+
+def clean_text(value):
+    """Remove illegal Excel characters from a string."""
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+# extracting text from files
+def extract_text_from_txts(directory):
+    abstracts = []
+    doc_to_text_mapping = {}
+    files = [f for f in os.listdir(directory) if f.endswith((".txt", ".pdf", ".doc", ".docx"))]
+
+    for file in files:
+        file_path = os.path.join(directory, file)
+        text = ""
+
+        if file.endswith(".txt"):
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        elif file.endswith(".pdf"):
+            try:
+                doc = fitz.open(file_path)
+                for page in doc:
+                    text += page.get_text()
+                doc.close()
+            except Exception as e:
+                print(f"Error reading PDF {file}: {e}")
+                continue
+        elif file.endswith(".docx"):
+
+                doc = docx.Document(file_path)
+                text="\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
+# using text splitter for making chunks
+        if text.strip():
+            chunks = text_splitter.split_text(text)
+            abstracts.extend(chunks)
+            doc_to_text_mapping.update({chunk: file for chunk in chunks})
+
+    return abstracts, doc_to_text_mapping
+
+
+# directory = r"C:\Users\wb648065\Desktop\main_file1"
+# giving the input Directory path
+directory=Path(__file__).parent/ "Test Input"
+directory = str(Path(directory).as_posix())
+abstracts, doc_to_text_mapping = extract_text_from_txts(directory)
+
+metadatas = []
+embeddings_list = []
+# enumerating Over abstracts to do embeddings
+for i, doc in enumerate(abstracts):
+    embedding = embeddings.embed_query(doc)
+    embeddings_list.append(embedding)
+    metadatas.append({
+        "doc_id": str(uuid4()),
+        "source_doc_index": i,
+        "file": doc_to_text_mapping[doc],
+    })
+#storing abstracts in vector store
+vectorstore = FAISS.from_embeddings(
+    text_embeddings=list(zip(abstracts, embeddings_list)),
+    embedding=embeddings,
+    metadatas=metadatas,
+)
+#saving it to local
+vectorstore.save_local("faiss_index")
+output_dir=Path(__file__).parent/ "output"
+output_dir.mkdir(parents=True, exist_ok=True)
+data = []
+# just storing chunks in a data frame
+for i, (doc, metadata, embedding) in enumerate(zip(abstracts, metadatas, embeddings_list)):
+    data.append({
+        "document": doc,
+        "doc_id": metadata["doc_id"],
+        "chunk_index": i,
+        "embedding_first_five": embedding[:5],
+        "file": metadata["file"],
+    })
+
+df = pd.DataFrame(data)
+#Loading vectors
+vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+unique_files = df["file"].unique()
+
+docstore = vectorstore.docstore
+index_to_docstore_id = vectorstore.index_to_docstore_id
+
+faiss_docs_index_to_id_mapping = pd.DataFrame(
+    [{"index": i, "doc_id": v} for i, v in index_to_docstore_id.items()]
+)
+
+df["document_matched"] = False
+similarity_results = []
+# searching  for similar chunks across different files and storing
+for file_name in unique_files:
+    # file_name_without_extension = file_name[:file_name.index(".txt")]
+    file_name_without_extension=os.path.splitext(file_name)[0]
+    file_embedding = np.array(embeddings.embed_query(file_name_without_extension)).reshape(1, -1)
+    distances, indices = vectorstore.index.search(file_embedding, k=20)
+
+    for idx, distance in zip(indices[0], distances[0]):
+        chunk_data = df.iloc[idx]
+        df.loc[idx, "document_matched"] = True
+        similarity_results.append({
+            "file": file_name,
+            "similar_chunk": chunk_data["document"],
+            "similar_chunk_id": chunk_data["doc_id"],
+            "similarity_score": 1 - distance,
+            "chunk_file": chunk_data["file"],
+        })
+
+similarity_df = pd.DataFrame(similarity_results)
+
+df_chunk_to_file_mapping = (
+    similarity_df[["file", "similar_chunk", "chunk_file"]]
+    .groupby("file")
+    .apply(lambda x: dict(zip(x["similar_chunk"], x["chunk_file"])))
+    .reset_index()
+    .rename(columns={0: "first_degree_chunk_to_file_mapping"})
+)
+
+df_similarity_grouped = (
+    similarity_df[["file", "similar_chunk"]].groupby("file").agg(list).reset_index()
+)
+df_similarity_grouped = df_similarity_grouped.merge(df_chunk_to_file_mapping, on="file", how="left")
+
+df_similarity_grouped["second_degree_closest_chunks"] = None
+df_similarity_grouped["second_degree_closest_chunks_file_mapping"] = None
+
+for ind, row in df_similarity_grouped.iterrows():
+    second_degree_similar_chunks = []
+    second_degree_similar_chunks_file_mapping = []
+
+    similar_chunks = row["similar_chunk"]
+    similar_chunks = [i for i in similar_chunks if isinstance(i, str) and len(i) > 60]
+
+    if not similar_chunks:
+        continue
+
+    similar_chunks = similar_chunks[0:5]
+    distances = []
+    indices = []
+    for similar_chunk in similar_chunks:
+        chunk_embedding = np.array(embeddings.embed_query(similar_chunk)).reshape(1, -1)
+        distance, index = vectorstore.index.search(chunk_embedding, k=20)
+        distances.extend(distance)
+        indices.extend(index)
+
+    for idx, distance in zip(indices[0], distances[0]):
+        chunk_data = df.iloc[idx]
+        df_chunk_data = pd.DataFrame(chunk_data).T
+
+        if not df_chunk_data.empty:
+            second_degree_similar_chunks.append(df_chunk_data["document"][idx])
+            mapping = {df_chunk_data["document"][idx]: df_chunk_data["file"][idx]}
+            second_degree_similar_chunks_file_mapping.append(mapping)
+
+    df_similarity_grouped.loc[ind, "second_degree_closest_chunks"] = " ;;;;; ".join(second_degree_similar_chunks)
+    df_similarity_grouped.loc[ind, "second_degree_closest_chunks_file_mapping"] = str(second_degree_similar_chunks_file_mapping)
+
+df_similarity_grouped["second_degree_representative_chunks"] = None
+for ind, row in df_similarity_grouped.iterrows():
+    second_degree_mapping = eval(row["second_degree_closest_chunks_file_mapping"])
+    d1 = dict()
+    for l2 in second_degree_mapping:
+        for i, v in l2.items():
+            d1[v] = i
+    df_similarity_grouped.loc[ind, "second_degree_representative_chunks"] = str(d1)
+# Generating Queries
+df_similarity_grouped["multi_hop_queries"] = None
+for ind, row in df_similarity_grouped.iterrows():
+    documents = row["second_degree_closest_chunks"]
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a helpful assistant that creates 5 different multi-hop query from the given documents. "
+                   "User will provide documents, which are separated by ;;;;; (five semicolons). "
+                   "Create a multi-hop query using all the documents provided, requiring at least two reasoning steps "
+                   "where the answer to the first step is necessary to resolve the second step. Ensure the query "
+                   "incorporates all important named entities across all the documents. Return the query only."),
+        ("human", "{documents}")
+    ])
+    chain = prompt | llm
+    questions = []
+
+    llm_response = chain.invoke({"documents": documents})
+    print("Multi-hop", llm_response.content)
+    questions.append(llm_response.content.strip())
+    df_similarity_grouped.loc[ind, "multi_hop_queries"] = "\n".join(
+        [f"{i+1}. {q}" for i, q in enumerate(questions)]
+    )
+    df_similarity_grouped.loc[ind, "multi_hop_source_chunk"] = documents
+
+df_similarity_grouped["single_hop_queries"] = None
+for ind, row in df_similarity_grouped.iterrows():
+    document = row["similar_chunk"][0]
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a helpful assistant that creates a 5 different single-hop query from the given document. "
+                   "The user will provide one document. Create a single-hop query that directly addresses the content "
+                   "of the document, incorporating all important named entities relevant to the document. "
+                   "Ensure the query is concise and uses each named entity accurately. Return the query only."),
+        ("human", "{document}")
+    ])
+    chain = prompt | llm
+    questions = []
+
+    llm_response = chain.invoke({"document": document})
+    print("singlehop", llm_response.content)
+    questions.append(llm_response.content.strip())
+
+    df_similarity_grouped.loc[ind, "single_hop_queries"] = "\n".join(
+        [f"{i+1}. {q}" for i, q in enumerate(questions)]
+    )
+    df_similarity_grouped.loc[ind, "single_hop_source_chunk"] = document
+
+df_similarity_grouped = df_similarity_grouped.rename(columns={
+    "similar_chunk": "closest_chunks",
+    "second_degree_closest_chunks": "second_degree_closest_chunks",
+    "second_degree_closest_chunks_file_mapping": "second_degree_closest_chunks_file_mapping",
+})
+
+# ✅ Export to CSV (original file)
+output_dir=Path(__file__).parent/ "output"
+output_dir.mkdir(parents=True, exist_ok=True)
+df_similarity_grouped.to_csv(output_dir / "test_data_generation_output.csv", index=False)
+
+# ✅ NEW: Export single-hop and multi-hop queries to Excel
+single_hop_all = []
+single_hop_sources = []
+multi_hop_all = []
+multi_hop_sources = []
+
+for _, row in df_similarity_grouped.iterrows():
+    # Single-hop
+    sh = row.get("single_hop_queries", "")
+    source_sh = row.get("single_hop_source_chunk", "")
+    if isinstance(sh, str) and sh.strip():
+        sh_qs = [q.strip(" 1234567890.-") for q in sh.split("\n") if q.strip()]
+        single_hop_all.extend(sh_qs)
+        # single_hop_sources.extend([source_sh] * len(sh_qs))
+        for _ in sh_qs:
+            single_hop_sources.append(source_sh if source_sh else "")
+
+    # Multi-hop
+    mh = row.get("multi_hop_queries", "")
+    source_mh = row.get("multi_hop_source_chunk", "")
+    if isinstance(mh, str):
+        mh_qs = [q.strip(" 1234567890.-") for q in mh.split("\n") if q.strip()]
+        multi_hop_all.extend(mh_qs)
+        multi_hop_sources.extend([source_mh] * len(mh_qs))
+
+max_len = max(len(single_hop_all), len(multi_hop_all))
+single_hop_all += [""] * (max_len - len(single_hop_all))
+multi_hop_all += [""] * (max_len - len(multi_hop_all))
+single_hop_sources += [""] * (max_len - len(single_hop_sources))
+multi_hop_sources += [""] * (max_len - len(multi_hop_sources))
+
+
+export_df = pd.DataFrame({
+    "Single-Hop Query": single_hop_all,
+    "Single-Hop Source Chunk": single_hop_sources,
+    "Multi-Hop Query": multi_hop_all,
+    "Multi-Hop Source Chunk": multi_hop_sources,
+
+})
+export_df = export_df.applymap(clean_text)
+export_df.to_excel(output_dir / "generated_queries.xlsx", index=False)
+
+print("done")
+def send_query_to_application_bot(user_msg):
+    """
+    Send a user query to the application bot endpoint and return response.
+    This is separate from send_query_to_dnr which is used for query generation.
+    """
+
+    payload = {
+        "message": user_msg,
+        "session_id": "47d6105f-d654-479a-9542-994a19aa3885",
+        "is_edit": False,
+        "history_id": 0,
+        "collection_tag": "dnr",
+        "quid": "3778dd83-e9b0-43e3-bf47-6a4206bf1132",
+        "is_first_query": True,
+        "beta": "false",
+        "filter_condition": []
+
+    }
+    response = requests.post(endpoint, headers=headers, json=payload, timeout=(10,60))
+
+
+    if response.status_code == 200:
+        try:
+            data = response.json()
+            return True, data.get("response", response.text)
+        except Exception:
+            return True, response.text
+    else:
+        return False, f"❌ API Error {response.status_code}: {response.text}"
+endpoint = "https://azapimqa.worldbank.org/maiext/api/wbchatendpoint/"
+headers = {
+    "ocp-apim-subscription-key": "c2c6910b084e4095824ab5baefae0f39",
+    "Content-Type": "application/json"}
+MAX_TURNS = 2
+def generate_multi_turn_conversation(goal, context, persona="Product Owner"):
+    conversation = []
+    user_msg = None
+
+    for turn in range(1, MAX_TURNS + 1):
+        if turn == 1:
+            # ✅ Directly use single-hop query as first user question
+            user_msg = goal
+            conversation.append({"user": user_msg})
+        else:
+            history = "\n".join(
+                [f"User: {m['user']}" if 'user' in m else f"Bot: {m['bot']}"
+                 for m in conversation]
+            )
+            prompt_text = f"""
+Continue this multi-turn conversation.
+
+Persona: {persona}
+Goal: {goal}
+Relevant context:
+{context}
+
+Conversation so far:
+{history}
+
+What would the user ask next? Respond ONLY with the next user message.
+""".strip()
+
+        # Next user message
+            chain = ChatPromptTemplate.from_messages([("human", "{prompt}")]) | llm
+            llm_response = chain.invoke({"prompt": prompt_text})
+            user_msg = llm_response.content.strip()
+            conversation.append({"user": user_msg})
+
+        # BOT reply
+        # BOT reply from application endpoint
+        ok, bot_msg = send_query_to_application_bot(user_msg)
+        conversation.append({"bot": bot_msg})
+
+        # ✅ Stop if goal achieved
+        if goal.lower() in bot_msg.lower():
+            break
+
+    return conversation
+
+
+
+# max_len = max(len(single_hop_all), len(multi_hop_all))
+# single_hop_all += [""] * (max_len - len(single_hop_all))
+# multi_hop_all += [""] * (max_len - len(multi_hop_all))
+# single_hop_sources += [""] * (max_len - len(single_hop_sources))
+# multi_hop_sources += [""] * (max_len - len(multi_hop_sources))
+#
+#
+# export_df = pd.DataFrame({
+#     "Single-Hop Query": single_hop_all,
+#     "Single-Hop Source Chunk": single_hop_sources,
+#     "Multi-Hop Query": multi_hop_all,
+#     "Multi-Hop Source Chunk": multi_hop_sources,
+#
+# })
+# export_df.to_excel(output_dir / "generated_queries.xlsx", index=False)
+#
+# print("done")
+
+df = pd.read_excel(output_dir / "generated_queries.xlsx")
+
+
+results=[]
+def send_query_to_dnr(query, chunk):
+    # if not session_id:
+    #     session_id = str(uuid.uuid4())  # generate random session ID
+
+    payload = {
+        "message": query,
+        "session_id": "47d6105f-d654-479a-9542-994a19aa3885",
+        "is_edit": False,
+        "history_id": 0,
+        "collection_tag": "dnr",
+        "quid": "3778dd83-e9b0-43e3-bf47-6a4206bf1132",
+        "is_first_query": True,
+        "beta": "false",
+        "filter_condition": []
+    }
+
+    response = requests.post(endpoint, headers=headers, json=payload)
+    print("Response==",response)
+    print("text==",response.text)
+    results.append({
+        "Question":query,
+        "Response":response.text,
+        "chunk":chunk,
+
+
+    }
+    )
+    return response.status_code, response.text
+query_to_chunk={
+    "Single-Hop Query":"Single-Hop Source Chunk",
+    "Multi-Hop Query":"Multi-Hop Source Chunk",
+}
+# Loop thros
+for index, row in df.iterrows():
+    for qtype in ["Single-Hop Query", "Multi-Hop Query"]:
+        query = row.get(qtype, "")
+        chunk=row.get(query_to_chunk[qtype], "")
+
+        if isinstance(query, str) and query.strip():
+            print(f"\n▶ Sending {qtype} - Row {index + 1}")
+            status, response = send_query_to_dnr(query,chunk)
+            print(f"Status Code: {status}")
+            print(f"Response: {response}")
+            time.sleep(1)  # Optional: to avoid rate limits or throttling
+response_df=pd.DataFrame(results)
+response_df = response_df.applymap(clean_text)
+response_df.to_excel(output_dir / "generated_responses.xlsx", index=False)
+
+df_queries = pd.read_excel(output_dir / "generated_queries.xlsx")
+
+multi_turn_all = []
+
+
+for idx, row in df_queries.iterrows():
+    goal = row["Single-Hop Query"]
+    context = row["Single-Hop Source Chunk"]
+
+    if not isinstance(goal, str) or not goal.strip():
+        multi_turn_all.append("")
+        continue
+
+    print(f"\n▶ Starting multi-turn conversation for query {idx+1}: {goal}")
+    conversation = generate_multi_turn_conversation(goal, context)
+
+    conv_text = "\n".join(
+        [f"User: {m['user']}" if 'user' in m else f"Bot: {m['bot']}"
+         for m in conversation]
+    )
+    multi_turn_all.append(conv_text)
+
+# # Fill rest with blanks so lengths match
+# multi_turn_all += [""] * (len(df_queries) - len(multi_turn_all))
+
+# === STEP 3: Save back to same Excel ===
+df_queries["Multi-Turn Conversation"] = multi_turn_all
+df_queries = df_queries.applymap(clean_text)
+df_queries.to_excel(output_dir / "generated_queries.xlsx", index=False)
+
+print("✅ Multi-turn conversations added and saved to same Excel.")
