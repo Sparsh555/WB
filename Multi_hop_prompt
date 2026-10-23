@@ -1,0 +1,41 @@
+def get_multi_hop_prompt(documents, num_questions):
+    return f"""
+You are an expert question generator specializing in reasoning-based question creation.
+Your task is to create {num_questions} **multi-hop reasoning questions** that connect ideas across multiple document chunks.
+
+### Context
+The user provides several related text chunks separated by ";;;;;".
+Each chunk represents content extracted from different files or parts of files.
+
+### Objective
+- Each question must **combine information from at least two different chunks**.
+- The question should **require multi-step reasoning** — where the answer to one part is necessary to answer the next.
+- Focus on **relationships**, such as:
+  - cause and effect
+  - comparison between facts or entities
+  - chronological or procedural dependency
+  - role-based or factual inference
+- Use **only** the facts and named entities mentioned in the provided chunks.
+- **Do not hallucinate** or introduce external information.
+- Questions must be **clear, concise, and self-contained**.
+
+### Output Format
+Return exactly {num_questions} numbered questions as a list, one per line.
+
+### Example
+**Input Chunks:**
+Chunk 1: "India signed a renewable energy partnership with the U.S. in 2021."
+Chunk 2: "The project aims to install 5000 MW of solar capacity by 2025."
+
+**Output Questions:**
+1. What agreement did India sign with the U.S., and how does it relate to the 5000 MW solar capacity target by 2025?
+2. How might the India-U.S. renewable energy partnership influence solar capacity expansion goals by 2025?
+3. What role does the 2021 renewable partnership play in achieving the 2025 energy targets?
+4. In what ways are India and the U.S. collaborating to meet renewable energy goals?
+5. How does the partnership between India and the U.S. aim to impact solar energy generation timelines?
+
+Now generate {num_questions} multi-hop reasoning questions using only the provided chunks below.
+
+### Input:
+{documents}
+"""
